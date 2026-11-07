@@ -1,0 +1,153 @@
+#!/bin/bash
+# xgimi-keeper — control the brightness-mode keeper running on your XGIMI projector.
+#
+#   xgimi-keeper install [performance|standard|eco]   copy keeper to projector & start it
+#   xgimi-keeper start | stop | restart
+#   xgimi-keeper status                               running?, protected mode, temperature, recent events
+#   xgimi-keeper log [-f]                             keeper log (-f = follow live)
+#   xgimi-keeper set performance|standard|eco         change the mode it protects (performance = apply now)
+#   xgimi-keeper fanhold <80-255>                     fan level while in Performance (default 255 = max; lower = quieter)
+#   xgimi-keeper fan probe|status|watch [secs]        read temperature sensors & fan speeds
+#   xgimi-keeper ensure                               start keeper if it isn't running (for auto-start)
+#   xgimi-keeper autostart on|off                     Mac re-launches keeper after projector reboots
+#   xgimi-keeper uninstall                            stop and remove from projector
+#
+# Projector IP: $XGIMI_IP (first time), then remembered in ./config.
+
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ADB="$HERE/platform-tools/adb"
+CONF="$HERE/config"
+if [ -n "${XGIMI_IP:-}" ]; then IP=$XGIMI_IP
+elif [ -f "$CONF" ]; then IP=$(cat "$CONF")
+else IP=""; fi
+SERIAL="$IP:5555"
+RD=/data/local/tmp/xgimi-keeper
+AGENT_ID=com.xgimi.mode-keeper
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_ID.plist"
+
+a() { "$ADB" -s "$SERIAL" "$@"; }
+[ -n "$IP" ] || [ "${1:-}" = help ] || [ "${1:-}" = autostart ] || { echo "xgimi-keeper: tell me the projector IP once, e.g.  XGIMI_IP=192.168.1.50 xgimi-keeper install" >&2; exit 1; }
+die() { echo "xgimi-keeper: $*" >&2; exit 1; }
+
+connect() {
+  [ -x "$ADB" ] || die "adb not found at $ADB"
+  "$ADB" connect "$SERIAL" >/dev/null 2>&1
+  local st; st=$("$ADB" -s "$SERIAL" get-state 2>/dev/null)
+  case "$st" in
+    device) return 0 ;;
+    unauthorized) die "projector at $IP is asking to allow debugging — accept the prompt on screen (tick 'Always allow')" ;;
+    *) [ "${QUIET:-0}" = 1 ] && exit 0; die "can't reach projector at $IP (is it on and on the same Wi-Fi?)" ;;
+  esac
+}
+running_pid() { a shell "p=\$(cat $RD/keeper.pid 2>/dev/null) && kill -0 \$p 2>/dev/null && echo \$p" 2>/dev/null | tr -d '\r'; }
+installed() { a shell "[ -f $RD/keeper.sh ] && echo yes" 2>/dev/null | tr -d '\r' | grep -q yes; }
+
+do_start() {
+  local pid; pid=$(running_pid)
+  if [ -n "$pid" ]; then echo "keeper already running on projector (pid $pid)"; return 0; fi
+  installed || die "keeper isn't installed yet — run: xgimi-keeper install"
+  a shell "cd $RD && setsid sh $RD/keeper.sh </dev/null >/dev/null 2>&1 &"
+  for _ in 1 2 3 4 5; do pid=$(running_pid); [ -n "$pid" ] && break; sleep 1; done
+  [ -n "$pid" ] && echo "keeper running on projector (pid $pid), protecting: $(a shell cat $RD/desired 2>/dev/null | tr -d '\r')" \
+                || die "keeper failed to start — check: xgimi-keeper log"
+}
+do_stop() {
+  a shell "p=\$(cat $RD/keeper.pid 2>/dev/null); [ -n \"\$p\" ] && kill \$p 2>/dev/null; pkill -f 'logcat -v brief -T 1 WindowSystem' 2>/dev/null; rm -f $RD/keeper.pid" >/dev/null 2>&1
+  echo "keeper stopped"
+}
+valid_mode() { case "$1" in performance|standard|eco) return 0 ;; *) die "mode must be performance, standard or eco" ;; esac; }
+
+cmd=${1:-status}; shift 2>/dev/null || true
+case "$cmd" in
+  install)
+    mode=${1:-performance}; valid_mode "$mode"
+    connect
+    echo "$IP" > "$CONF"
+    a shell "mkdir -p $RD" >/dev/null
+    a push "$HERE/keeper.sh" "$RD/keeper.sh" >/dev/null 2>&1 || die "copy failed"
+    a push "$HERE/fanctl/fanctl.jar" "$RD/fanctl.jar" >/dev/null 2>&1 || die "copy of fanctl.jar failed (build it: fanctl/build.sh)"
+    a shell "chmod 755 $RD/keeper.sh; echo $mode > $RD/desired"
+    do_stop >/dev/null; do_start
+    ;;
+  start)   connect; do_start ;;
+  stop)    connect; do_stop ;;
+  restart) connect; do_stop >/dev/null; do_start ;;
+  status)
+    connect
+    pid=$(running_pid)
+    echo "Projector : $IP"
+    if [ -n "$pid" ]; then echo "Keeper    : running (pid $pid)"; else echo "Keeper    : NOT running  (xgimi-keeper start)"; fi
+    echo "Protecting: $(a shell cat $RD/desired 2>/dev/null | tr -d '\r')"
+    m=$(a shell "gmpfUnit getDlpLumensMode" 2>/dev/null | tr -dc '0-9')
+    case "$m" in 1|18) mn="Performance" ;; 0) mn="Standard" ;; *) mn="other" ;; esac
+    echo "Light mode: $mn ($m)"
+    echo "Sensors   : $(a shell "CLASSPATH=$RD/fanctl.jar app_process32 /system/bin Fanctl status" 2>/dev/null | tr -d '\r' | sed 's/^[0-9:]* *//')"
+    echo "Power     : $(a shell "dumpsys power | grep mWakefulness= | head -n 1" | tr -d '\r ' )"
+    echo; echo "Recent keeper events:"
+    a shell "tail -n 12 $RD/keeper.log 2>/dev/null" | sed 's/^/  /'
+    ;;
+  log)
+    connect
+    if [ "${1:-}" = "-f" ]; then a shell "tail -n 30 -f $RD/keeper.log"; else a shell "tail -n 60 $RD/keeper.log"; fi
+    ;;
+  set)
+    mode=${1:-}; valid_mode "$mode"
+    connect
+    [ -n "$(running_pid)" ] || die "keeper isn't running — run: xgimi-keeper start"
+    a shell "echo 'request $mode' >> $RD/events"
+    if [ "$mode" = performance ]; then
+      echo "now protecting: performance — the keeper will switch it on within ~15 s (if the projector isn't too hot)"
+    else
+      echo "now protecting: $mode — select it with the remote if it isn't already; the keeper won't push Performance"
+    fi
+    ;;
+  fanhold)
+    lvl=${1:-}; case "$lvl" in ''|*[!0-9]*) die "usage: xgimi-keeper fanhold <80-255>" ;; esac
+    [ "$lvl" -ge 80 ] && [ "$lvl" -le 255 ] || die "fan hold must be 80-255"
+    connect
+    a shell "echo FAN_HOLD=$lvl > $RD/config"
+    do_stop >/dev/null; do_start
+    echo "fan hold in Performance = $lvl (auto-raises to max if internal temp reaches 55°C)"
+    ;;
+  fan)
+    connect
+    a shell "CLASSPATH=$RD/fanctl.jar app_process32 /system/bin Fanctl ${*:-probe}"
+    ;;
+  ensure)
+    QUIET=1 connect
+    installed || exit 0
+    [ -n "$(running_pid)" ] || do_start
+    ;;
+  autostart)
+    case "${1:-}" in
+      on)
+        mkdir -p "$HOME/Library/LaunchAgents"
+        cat > "$AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$AGENT_ID</string>
+  <key>ProgramArguments</key><array><string>$HERE/xgimi-keeper</string><string>ensure</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$HERE/autostart.log</string>
+  <key>StandardErrorPath</key><string>$HERE/autostart.log</string>
+</dict></plist>
+PLIST
+        launchctl unload "$AGENT_PLIST" 2>/dev/null; launchctl load "$AGENT_PLIST"
+        echo "autostart on — your Mac re-launches the keeper (checked every 5 min) after projector reboots"
+        ;;
+      off)
+        launchctl unload "$AGENT_PLIST" 2>/dev/null; rm -f "$AGENT_PLIST"
+        echo "autostart off"
+        ;;
+      *) die "usage: xgimi-keeper autostart on|off" ;;
+    esac
+    ;;
+  uninstall)
+    connect; do_stop >/dev/null; a shell "rm -rf $RD"; echo "keeper removed from projector"
+    ;;
+  -h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$cmd' (try: xgimi-keeper help)" ;;
+esac

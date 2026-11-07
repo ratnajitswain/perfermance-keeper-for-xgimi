@@ -1,0 +1,18 @@
+# downloaded build tools (scripts/setup-toolchain.sh fetches them)
+toolchain/
+platform-tools/
+
+# build outputs
+app/build/
+fanctl/build/
+fanctl/fanctl.jar
+*.apk
+dist/
+
+# secrets / local machine state — never commit
+*.jks
+*.keystore
+config
+autostart.log
+
+.DS_Store
